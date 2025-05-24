@@ -1,63 +1,101 @@
 mod cli;
+mod event_processor;
+
+use std::io::IsTerminal;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use cli::Cli;
 use codex_core::codex_wrapper;
+use codex_core::config::Config;
+use codex_core::config::ConfigOverrides;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::Event;
 use codex_core::protocol::EventMsg;
-use codex_core::protocol::FileChange;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
+use codex_core::protocol::TaskCompleteEvent;
 use codex_core::util::is_inside_git_repo;
+use event_processor::EventProcessor;
+use event_processor::print_config_summary;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
-    // TODO(mbolin): Take a more thoughtful approach to logging.
-    let default_level = "error";
-    let allow_ansi = true;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .or_else(|_| EnvFilter::try_new(default_level))
-                .unwrap(),
-        )
-        .with_ansi(allow_ansi)
-        .with_writer(std::io::stderr)
-        .try_init();
-
+pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     let Cli {
         images,
         model,
+        config_profile,
+        full_auto,
+        sandbox,
+        cwd,
         skip_git_repo_check,
         disable_response_storage,
+        color,
+        last_message_file,
         prompt,
-        ..
     } = cli;
 
-    if !skip_git_repo_check && !is_inside_git_repo() {
+    let (stdout_with_ansi, stderr_with_ansi) = match color {
+        cli::Color::Always => (true, true),
+        cli::Color::Never => (false, false),
+        cli::Color::Auto => (
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal(),
+        ),
+    };
+
+    let sandbox_policy = if full_auto {
+        Some(SandboxPolicy::new_full_auto_policy())
+    } else {
+        sandbox.permissions.clone().map(Into::into)
+    };
+
+    // Load configuration and determine approval policy
+    let overrides = ConfigOverrides {
+        model,
+        config_profile,
+        // This CLI is intended to be headless and has no affordances for asking
+        // the user for approval.
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_policy,
+        disable_response_storage: if disable_response_storage {
+            Some(true)
+        } else {
+            None
+        },
+        cwd: cwd.map(|p| p.canonicalize().unwrap_or(p)),
+        model_provider: None,
+        codex_linux_sandbox_exe,
+    };
+    let config = Config::load_with_overrides(overrides)?;
+    // Print the effective configuration so users can see what Codex is using.
+    print_config_summary(&config, stdout_with_ansi);
+
+    if !skip_git_repo_check && !is_inside_git_repo(&config) {
         eprintln!("Not inside a Git repo and --skip-git-repo-check was not specified.");
-        std::process::exit(1);
-    } else if images.is_empty() && prompt.is_none() {
-        eprintln!("No images or prompt specified.");
         std::process::exit(1);
     }
 
-    // TODO(mbolin): We are reworking the CLI args right now, so this will
-    // likely come from a new --execution-policy arg.
-    let approval_policy = AskForApproval::Never;
-    let sandbox_policy = SandboxPolicy::NetworkAndFileWriteRestricted;
-    let (codex_wrapper, event, ctrl_c) = codex_wrapper::init_codex(
-        approval_policy,
-        sandbox_policy,
-        disable_response_storage,
-        model,
-    )
-    .await?;
+    // TODO(mbolin): Take a more thoughtful approach to logging.
+    let default_level = "error";
+    let _ = tracing_subscriber::fmt()
+        // Fallback to the `default_level` log filter if the environment
+        // variable is not set _or_ contains an invalid value
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new(default_level))
+                .unwrap_or_else(|_| EnvFilter::new(default_level)),
+        )
+        .with_ansi(stderr_with_ansi)
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let (codex_wrapper, event, ctrl_c) = codex_wrapper::init_codex(config).await?;
     let codex = Arc::new(codex_wrapper);
     info!("Codex initialized with event: {event:?}");
 
@@ -83,7 +121,6 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
                     res = codex.next_event() => match res {
                         Ok(event) => {
                             debug!("Received event: {event:?}");
-                            process_event(&event);
                             if let Err(e) = tx.send(event) {
                                 error!("Error sending event: {e:?}");
                                 break;
@@ -99,8 +136,8 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
+    // Send images first, if any.
     if !images.is_empty() {
-        // Send images first.
         let items: Vec<InputItem> = images
             .into_iter()
             .map(|path| InputItem::LocalImage { path })
@@ -108,107 +145,61 @@ pub async fn run_main(cli: Cli) -> anyhow::Result<()> {
         let initial_images_event_id = codex.submit(Op::UserInput { items }).await?;
         info!("Sent images with event ID: {initial_images_event_id}");
         while let Ok(event) = codex.next_event().await {
-            if event.id == initial_images_event_id && matches!(event.msg, EventMsg::TaskComplete) {
+            if event.id == initial_images_event_id
+                && matches!(
+                    event.msg,
+                    EventMsg::TaskComplete(TaskCompleteEvent {
+                        last_agent_message: _,
+                    })
+                )
+            {
                 break;
             }
         }
     }
 
-    if let Some(prompt) = prompt {
-        // Send the prompt.
-        let items: Vec<InputItem> = vec![InputItem::Text { text: prompt }];
-        let initial_prompt_task_id = codex.submit(Op::UserInput { items }).await?;
-        info!("Sent prompt with event ID: {initial_prompt_task_id}");
-        while let Some(event) = rx.recv().await {
-            if event.id == initial_prompt_task_id && matches!(event.msg, EventMsg::TaskComplete) {
-                break;
+    // Send the prompt.
+    let items: Vec<InputItem> = vec![InputItem::Text { text: prompt }];
+    let initial_prompt_task_id = codex.submit(Op::UserInput { items }).await?;
+    info!("Sent prompt with event ID: {initial_prompt_task_id}");
+
+    // Run the loop until the task is complete.
+    let mut event_processor = EventProcessor::create_with_ansi(stdout_with_ansi);
+    while let Some(event) = rx.recv().await {
+        let (is_last_event, last_assistant_message) = match &event.msg {
+            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
+                (true, last_agent_message.clone())
             }
+            _ => (false, None),
+        };
+        event_processor.process_event(event);
+        if is_last_event {
+            handle_last_message(last_assistant_message, last_message_file.as_deref())?;
+            break;
         }
     }
 
     Ok(())
 }
 
-fn process_event(event: &Event) {
-    let Event { id, msg } = event;
-    match msg {
-        EventMsg::Error { message } => {
-            println!("Error: {message}");
+fn handle_last_message(
+    last_agent_message: Option<String>,
+    last_message_file: Option<&Path>,
+) -> std::io::Result<()> {
+    match (last_agent_message, last_message_file) {
+        (Some(last_agent_message), Some(last_message_file)) => {
+            // Last message and a file to write to.
+            std::fs::write(last_message_file, last_agent_message)?;
         }
-        EventMsg::BackgroundEvent { .. } => {
-            // Ignore these for now.
+        (None, Some(last_message_file)) => {
+            eprintln!(
+                "Warning: No last message to write to file: {}",
+                last_message_file.to_string_lossy()
+            );
         }
-        EventMsg::TaskStarted => {
-            println!("Task started: {id}");
-        }
-        EventMsg::TaskComplete => {
-            println!("Task complete: {id}");
-        }
-        EventMsg::AgentMessage { message } => {
-            println!("Agent message: {message}");
-        }
-        EventMsg::ExecCommandBegin {
-            call_id,
-            command,
-            cwd,
-        } => {
-            println!("exec('{call_id}'): {:?} in {cwd}", command);
-        }
-        EventMsg::ExecCommandEnd {
-            call_id,
-            stdout,
-            stderr,
-            exit_code,
-        } => {
-            let output = if *exit_code == 0 { stdout } else { stderr };
-            let truncated_output = output.lines().take(5).collect::<Vec<_>>().join("\n");
-            println!("exec('{call_id}') exited {exit_code}:\n{truncated_output}");
-        }
-        EventMsg::PatchApplyBegin {
-            call_id,
-            auto_approved,
-            changes,
-        } => {
-            let changes = changes
-                .iter()
-                .map(|(path, change)| {
-                    format!("{} {}", format_file_change(change), path.to_string_lossy())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("apply_patch('{call_id}') auto_approved={auto_approved}:\n{changes}");
-        }
-        EventMsg::PatchApplyEnd {
-            call_id,
-            stdout,
-            stderr,
-            success,
-        } => {
-            let (exit_code, output) = if *success { (0, stdout) } else { (1, stderr) };
-            let truncated_output = output.lines().take(5).collect::<Vec<_>>().join("\n");
-            println!("apply_patch('{call_id}') exited {exit_code}:\n{truncated_output}");
-        }
-        EventMsg::ExecApprovalRequest { .. } => {
-            // Should we exit?
-        }
-        EventMsg::ApplyPatchApprovalRequest { .. } => {
-            // Should we exit?
-        }
-        _ => {
-            // Ignore event.
+        (_, None) => {
+            // No last message and no file to write to.
         }
     }
-}
-
-fn format_file_change(change: &FileChange) -> &'static str {
-    match change {
-        FileChange::Add { .. } => "A",
-        FileChange::Delete => "D",
-        FileChange::Update {
-            move_path: Some(_), ..
-        } => "R",
-        FileChange::Update {
-            move_path: None, ..
-        } => "M",
-    }
+    Ok(())
 }
